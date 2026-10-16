@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>色覚シミュレーション 左右比較</title>
+<style>
+  :root { --bg:#111; --fg:#f2f2f2; --accent:#4da3ff; --muted:#9aa0a6; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font-family: system-ui, -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; }
+  header { padding: 12px 16px 4px; }
+  h1 { font-size: 1.05rem; margin: 0; }
+  .sub { font-size: .8rem; color: var(--muted); margin-top: 2px; }
+
+  #start { display:block; margin: 24px auto; padding: 14px 28px; font-size: 1rem;
+           border:0; border-radius: 999px; background: var(--accent); color:#fff; }
+  #msg { margin: 8px 16px; color:#ffb4a9; font-size:.9rem; white-space:pre-wrap; }
+
+  /* 縦持ち: 上下に並べる / 横持ち: 左右に並べる */
+  #views { display:none; grid-template-columns: 1fr; gap: 6px; padding: 0 8px; }
+  @media (orientation: landscape) { #views { grid-template-columns: 1fr 1fr; } }
+  figure { margin:0; position:relative; background:#000; border-radius:8px; overflow:hidden; }
+  figure video, figure canvas { width:100%; display:block; }
+  figcaption { position:absolute; left:8px; top:8px; padding:2px 8px; font-size:.75rem;
+               background:rgba(0,0,0,.6); border-radius:999px; }
+
+  #controls { display:none; padding: 10px 8px 0; }
+  .tabs { display:flex; gap:6px; }
+  .tabs button { flex:1; padding: 10px 4px; font-size:.85rem; color:var(--fg);
+                 background:#262626; border:1px solid #3a3a3a; border-radius:8px; }
+  .tabs button[aria-pressed="true"] { background:var(--accent); border-color:var(--accent); color:#fff; }
+  #desc { margin: 10px 4px 0; font-size:.85rem; line-height:1.6; }
+  #note { margin: 10px 4px 24px; font-size:.7rem; color:var(--muted); line-height:1.5; }
+</style>
+</head>
+<body>
+<header>
+  <h1>色覚シミュレーション 左右比較</h1>
+  <div class="sub">通常の見え方と、色覚特性の見え方を同時に表示します</div>
+</header>
+
+<button id="start">カメラを起動する</button>
+<div id="msg"></div>
+
+<div id="views">
+  <figure><video id="video" playsinline muted></video><figcaption>通常</figcaption></figure>
+  <figure><canvas id="out"></canvas><figcaption id="outLabel">1型(P)</figcaption></figure>
+</div>
+
+<div id="controls">
+  <div class="tabs" id="tabs"></div>
+  <div id="desc"></div>
+  <div id="note">
+    ※ Viénot / Brettel 法ベースの近似行列によるシミュレーションです。
+    実際の見え方を完全に再現するものではありません。個人差があります。
+  </div>
+</div>
+
+<script>
+// ---- 色覚タイプの定義(線形RGB空間で適用する3x3行列) ----
+// 行列の値は公開されている近似値。論文(Viénot 1999 / Brettel 1997)と照合して確認すること。
+const TYPES = {
+  P: { label: "1型(P)", desc: "1型(P型): 赤を感じる錐体が働かない。赤が暗く、黒っぽく見えやすい。",
+       m: [0.11238, 0.88762, 0.0,   0.11238, 0.88762, 0.0,   0.00401, -0.00401, 1.0] },
+  D: { label: "2型(D)", desc: "2型(D型): 緑を感じる錐体が働かない。赤と緑の区別がつきにくい。",
+       m: [0.29275, 0.70725, 0.0,   0.29275, 0.70725, 0.0,   -0.02234, 0.02234, 1.0] },
+  T: { label: "3型(T)", desc: "3型(T型): 青を感じる錐体が働かない(まれ)。青と緑、黄と紫の区別がつきにくい。",
+       m: [1.0, 0.15236, -0.15236,   0.0, 0.86717, 0.13283,   0.0, 0.86717, 0.13283] },
+};
+let current = "P";
+
+// sRGB(0-255) <-> 線形(0-1) の変換テーブル
+const toLinear = new Float32Array(256);
+for (let i = 0; i < 256; i++) {
+  const c = i / 255;
+  toLinear[i] = c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+}
+function toSRGB(v) {
+  v = Math.min(1, Math.max(0, v));
+  const c = v <= 0.0031308 ? v * 12.92 : 1.055 * Math.pow(v, 1 / 2.4) - 0.055;
+  return Math.round(c * 255);
+}
+
+// ---- 画面部品 ----
+const $ = (id) => document.getElementById(id);
+const video = $("video"), out = $("out"), ctx = out.getContext("2d", { willReadFrequently: true });
+const work = document.createElement("canvas"), wctx = work.getContext("2d", { willReadFrequently: true });
+const WORK_WIDTH = 360; // 処理を軽くするため縮小して変換する
+
+// タブ(切替ボタン)を作る
+Object.keys(TYPES).forEach((k) => {
+  const b = document.createElement("button");
+  b.textContent = TYPES[k].label;
+  b.setAttribute("aria-pressed", k === current);
+  b.onclick = () => select(k);
+  $("tabs").appendChild(b);
+});
+function select(k) {
+  current = k;
+  [...$("tabs").children].forEach((b, i) => b.setAttribute("aria-pressed", Object.keys(TYPES)[i] === k));
+  $("desc").textContent = TYPES[k].desc;
+  $("outLabel").textContent = TYPES[k].label;
+}
+select(current);
+
+// ---- カメラ起動 ----
+$("start").onclick = async () => {
+  $("msg").textContent = "";
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    $("msg").textContent = "このブラウザではカメラを使えません。\nHTTPS(https://…)で開いているか確認してください。";
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: "environment" } }, audio: false,
+    });
+    video.srcObject = stream;
+    await video.play();
+    $("start").style.display = "none";
+    $("views").style.display = "grid";
+    $("controls").style.display = "block";
+    requestAnimationFrame(loop);
+  } catch (e) {
+    $("msg").textContent = "カメラを起動できませんでした。\n・ブラウザのカメラ許可をオンにしてください\n・他のアプリがカメラを使っていないか確認してください\n(" + e.name + ")";
+  }
+};
+
+// ---- 毎フレームの変換 ----
+function loop() {
+  if (video.videoWidth) {
+    const w = WORK_WIDTH, h = Math.round(w * video.videoHeight / video.videoWidth);
+    if (work.width !== w || work.height !== h) { work.width = out.width = w; work.height = out.height = h; }
+    wctx.drawImage(video, 0, 0, w, h);
+    const img = wctx.getImageData(0, 0, w, h), d = img.data, m = TYPES[current].m;
+    for (let i = 0; i < d.length; i += 4) {
+      const r = toLinear[d[i]], g = toLinear[d[i + 1]], b = toLinear[d[i + 2]];
+      d[i]     = toSRGB(m[0] * r + m[1] * g + m[2] * b);
+      d[i + 1] = toSRGB(m[3] * r + m[4] * g + m[5] * b);
+      d[i + 2] = toSRGB(m[6] * r + m[7] * g + m[8] * b);
+    }
+    ctx.putImageData(img, 0, 0);
+  }
+  requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>
